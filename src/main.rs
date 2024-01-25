@@ -33,6 +33,21 @@ fn parse_bencoded_value(input: &str) -> Option<(serde_json::Value, &str)> {
             }
             Some((vec.into(), &input[1..]))
         },
+        Some('d') => {
+            let mut input = &input[1..];
+            let mut d = serde_json::Map::new();
+            while input.chars().next()? != 'e' {
+                
+                let (key,rest) = parse_bencoded_string(input)?;
+                let (val,rest) = parse_bencoded_value(rest)?;
+                if let serde_json::Value::String(key) = key {
+                    d.insert(key,val);
+                }
+                input = rest;
+                
+            }
+            Some((d.into(), &input[1..]))
+        }
         _ => None,
     }
 }
