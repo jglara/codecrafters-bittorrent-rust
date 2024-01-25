@@ -4,19 +4,41 @@ use std::env;
 // Available if you need it!
 // use serde_bencode
 
-fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    if let Some(s) = encoded_value
+fn parse_bencoded_string(input: &str) -> Option<(serde_json::Value, &str)> {
+    input
         .split_once(":")
         .and_then(|(len, rest)| Some((len.parse::<usize>().ok()?, rest)))
-        .map(|(len, rest)| &rest[..len])
-    {
-        s.into()
-    } else if let Some(i) = encoded_value
+        .map(|(len, rest)| ((&rest[..len]).into(), &rest[len..]))
+}
+
+fn parse_bencoded_i64(input: &str) -> Option<(serde_json::Value, &str)> {
+    input
         .strip_prefix('i')
         .and_then(|rest| rest.split_once('e'))
-        .and_then(|(s,_)| s.parse::<i64>().ok())
-    {
-        i.into()
+        .and_then(|(s, rest)| Some((s.parse::<i64>().ok()?.into(), rest)))
+}
+
+fn parse_bencoded_value(input: &str) -> Option<(serde_json::Value, &str)> {
+    match input.chars().next() {
+        Some('i') => parse_bencoded_i64(input),
+        Some('0'..='9') => parse_bencoded_string(input),
+        Some('l') => input[1..].strip_suffix('e').and_then(|mut input| {
+            //eprintln!("parsing {input:?}");
+            let mut vec = vec![];
+            while !input.is_empty() {
+                let (v, rem) = parse_bencoded_value(input)?;
+                vec.push(v);
+                input = rem;
+            }
+            Some((vec.into(), ""))
+        }),
+        _ => None,
+    }
+}
+
+fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
+    if let Some((v,_)) = parse_bencoded_value(encoded_value) {
+        v
     } else {
         panic!("Unhandled encoded value: {}", encoded_value)
     }
