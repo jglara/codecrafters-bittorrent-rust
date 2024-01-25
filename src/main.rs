@@ -7,14 +7,14 @@ use std::env;
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     if let Some(s) = encoded_value
         .split_once(":")
-        .and_then(|(len, rest)| len.parse::<usize>().ok().and_then(|n| Some(&rest[..n])))
+        .and_then(|(len, rest)| Some((len.parse::<usize>().ok()?, rest)))
+        .map(|(len, rest)| &rest[..len])
     {
         s.into()
-        //serde_json::Value::String(s.to_string())
     } else if let Some(i) = encoded_value
         .strip_prefix('i')
-        .and_then(|rest| rest.strip_suffix('e'))
-        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|rest| rest.split_once('e'))
+        .and_then(|(s,_)| s.parse::<i64>().ok())
     {
         i.into()
     } else {
