@@ -9,7 +9,14 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         .split_once(":")
         .and_then(|(len, rest)| len.parse::<usize>().ok().and_then(|n| Some(&rest[..n])))
     {
-        serde_json::Value::String(s.to_string())
+        s.into()
+        //serde_json::Value::String(s.to_string())
+    } else if let Some(i) = encoded_value
+        .strip_prefix('i')
+        .and_then(|rest| rest.strip_suffix('e'))
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        i.into()
     } else {
         panic!("Unhandled encoded value: {}", encoded_value)
     }
