@@ -22,16 +22,17 @@ fn parse_bencoded_value(input: &str) -> Option<(serde_json::Value, &str)> {
     match input.chars().next() {
         Some('i') => parse_bencoded_i64(input),
         Some('0'..='9') => parse_bencoded_string(input),
-        Some('l') => input[1..].strip_suffix('e').and_then(|mut input| {
+        Some('l') => {
             //eprintln!("parsing {input:?}");
+            let mut input = &input[1..];
             let mut vec = vec![];
-            while !input.is_empty() {
+            while input.chars().next()? != 'e' {
                 let (v, rem) = parse_bencoded_value(input)?;
                 vec.push(v);
                 input = rem;
             }
-            Some((vec.into(), ""))
-        }),
+            Some((vec.into(), &input[1..]))
+        },
         _ => None,
     }
 }
