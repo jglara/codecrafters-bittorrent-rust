@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
             
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
-            println!("Info hash: {}", hex::encode(hashed_info));
+            println!("Info Hash: {}", hex::encode(hashed_info));
         }
     }
 
