@@ -3,6 +3,7 @@ use clap::Parser;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use sha1::{Sha1, Digest};
 
 use std::fs;
 use std::path::PathBuf;
@@ -114,8 +115,15 @@ fn main() -> anyhow::Result<()> {
         Command::Info{path} => {
             let content = fs::read(path).context("Reading torrent file")?;
             let torrent = serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+
+            let info = serde_bencode::to_bytes(&torrent.info)?;
+            let mut hasher = Sha1::new();
+            hasher.update(&info);
+            let hashed_info = hasher.finalize();
+            
             println!("Tracker URL: {}", torrent.announce);
-            println!("Length: {}", torrent.info.length)    
+            println!("Length: {}", torrent.info.length);
+            println!("Info hash: {}", hex::encode(hashed_info));
         }
     }
 
