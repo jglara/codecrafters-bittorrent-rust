@@ -1,8 +1,13 @@
+use anyhow::Context;
+use clap::Parser;
+use clap::Subcommand;
+use serde::{Deserialize, Serialize};
 use serde_json;
-use std::env;
 
-// Available if you need it!
-// use serde_bencode
+use std::fs;
+use std::path::PathBuf;
+use clap;
+use serde_bencode;
 
 fn parse_bencoded_string(input: &str) -> Option<(serde_json::Value, &str)> {
     input
@@ -60,20 +65,61 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     }
 }
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    if command == "decode" {
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        eprintln!("Logs from your program will appear here!");
-
-        // Uncomment this block to pass the first stage
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value.to_string());
-    } else {
-        eprintln!("unknown command: {}", args[1])
+#[derive(Subcommand)]
+enum Command {
+    Decode {
+        value: String
+    },
+    Info {
+        path: PathBuf
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TorrentInfo {
+    name: String,
+
+    #[serde(rename = "piece length")]
+    piece_length: usize,
+
+    #[serde(with = "serde_bytes")]
+    pieces: Vec<u8>,
+
+    length: usize
+
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TorrentFile {
+    announce: String,
+    info: TorrentInfo,
+}
+
+
+fn main() -> anyhow::Result<()> {
+
+    let args = Args::parse();
+
+    match args.command {
+        Command::Decode{value} => {
+            let decoded_value = decode_bencoded_value(&value);
+            println!("{decoded_value}");
+        }
+        Command::Info{path} => {
+            let content = fs::read(path).context("Reading torrent file")?;
+            let torrent = serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+            println!("Tracker URL: {}", torrent.announce);
+            println!("Length: {}", torrent.info.length)    
+        }
+    }
+
+
+    Ok(())
+}
+
