@@ -1,5 +1,9 @@
 use anyhow::{anyhow, Context};
 use bittorrent_starter_rust::parser::decode_bencoded_value;
+use bittorrent_starter_rust::peer::Handshake;
+use bittorrent_starter_rust::peer::HANDSHAKE_LEN;
+use bytes::Bytes;
+use bytes::BytesMut;
 use clap::Parser;
 use clap::Subcommand;
 use reqwest::Client;
@@ -10,13 +14,16 @@ use sha1::{Digest, Sha1};
 
 use clap;
 use serde_bencode;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use std::fs;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
+use std::ops::Deref;
+use tokio::net::TcpStream;
 
 use std::path::PathBuf;
-
-
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -30,6 +37,7 @@ enum Command {
     Decode { value: String },
     Info { path: PathBuf },
     Peers { path: PathBuf },
+    Handshake { path: PathBuf, peer: SocketAddr },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +139,6 @@ async fn main() -> anyhow::Result<()> {
             let torrent =
                 serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
 
-            
             let tracker_url = reqwest::Url::parse(&format!(
                 "{}?info_hash={}",
                 torrent.announce,
@@ -159,19 +166,42 @@ async fn main() -> anyhow::Result<()> {
                 .context("Decoding response")?;
 
             //eprintln!("{response:?}");
-
+            // let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
             let peers: Vec<_> = response
                 .peers
                 .chunks_exact(6)
                 .map(|c| {
-                    SocketAddrV4::new(
-                        Ipv4Addr::new(c[0], c[1], c[2], c[3]),
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(c[0], c[1], c[2], c[3])),
                         u16::from_be_bytes([c[4], c[5]]),
                     )
                 })
                 .collect();
 
             peers.iter().for_each(|p| println!("{p:?}"));
+        }
+
+        Command::Handshake { path, peer } => {
+            eprintln!("{path:?} {peer:?}");
+            let content = fs::read(path).context("Reading torrent file")?;
+            let torrent =
+                serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+
+            let mut tcp_peer = TcpStream::connect(peer)
+                .await
+                .context("Connecting to peer")?;
+
+            
+            let hs = Handshake::new(torrent.info.hash()?, b"00112233445566778899".to_owned());
+            tcp_peer.write_all(&hs.to_bytes()).await?;
+
+            let mut buf = [0; HANDSHAKE_LEN];
+            tcp_peer.read_exact(& mut buf).await?;
+
+            //eprintln!("{buf:?}");
+
+            let hs_resp = Handshake::from_bytes(&buf)?;
+            eprintln!("Peer ID: {}", hex::encode(hs_resp.peer_id));
         }
     }
 
