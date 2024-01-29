@@ -2,8 +2,7 @@ use anyhow::{anyhow, Context};
 use bittorrent_starter_rust::parser::decode_bencoded_value;
 use bittorrent_starter_rust::peer::Handshake;
 use bittorrent_starter_rust::peer::HANDSHAKE_LEN;
-use bytes::Bytes;
-use bytes::BytesMut;
+
 use clap::Parser;
 use clap::Subcommand;
 use reqwest::Client;
@@ -14,13 +13,13 @@ use sha1::{Digest, Sha1};
 
 use clap;
 use serde_bencode;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use std::fs;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::ops::Deref;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+
 use tokio::net::TcpStream;
 
 use std::path::PathBuf;
@@ -191,17 +190,16 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("Connecting to peer")?;
 
-            
             let hs = Handshake::new(torrent.info.hash()?, b"00112233445566778899".to_owned());
             tcp_peer.write_all(&hs.to_bytes()).await?;
 
             let mut buf = [0; HANDSHAKE_LEN];
-            tcp_peer.read_exact(& mut buf).await?;
+            tcp_peer.read_exact(&mut buf).await?;
 
             //eprintln!("{buf:?}");
 
             let hs_resp = Handshake::from_bytes(&buf)?;
-            eprintln!("Peer ID: {}", hex::encode(hs_resp.peer_id));
+            println!("Peer ID: {}", hex::encode(hs_resp.peer_id));
         }
     }
 
