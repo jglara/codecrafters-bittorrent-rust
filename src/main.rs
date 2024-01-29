@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use clap::Subcommand;
+use reqwest::Client;
+use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha1::{Digest, Sha1};
@@ -8,6 +10,9 @@ use sha1::{Digest, Sha1};
 use clap;
 use serde_bencode;
 use std::fs;
+use std::net::Ipv4Addr;
+use std::net::SocketAddrV4;
+use std::os::unix::net::SocketAddr;
 use std::path::PathBuf;
 
 fn parse_bencoded_string(input: &str) -> Option<(serde_json::Value, &str)> {
@@ -75,6 +80,7 @@ struct Args {
 enum Command {
     Decode { value: String },
     Info { path: PathBuf },
+    Peers { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +117,34 @@ struct TorrentFile {
     info: TorrentInfo,
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Debug, Clone, Serialize)]
+struct TrackerRequest {
+    //#[serde(serialize_with="hash_encode")]
+    //info_hash: [u8; 20],
+    peer_id: String,
+    port: u16,
+    uploaded: usize,
+    downloaded: usize,
+    left: usize,
+    compact: u8,
+}
+
+fn hash_encode(t: &[u8; 20]) -> String {
+    let encoded: String = t.iter().map(|b| format!("%{:02x}", b)).collect();
+    //eprintln!("{encoded}");
+    encoded
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TrackerResponse {
+    interval: u32,
+
+    #[serde(with = "serde_bytes")]
+    peers: Vec<u8>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
@@ -139,6 +172,57 @@ fn main() -> anyhow::Result<()> {
                 .piece_hashes()?
                 .iter()
                 .for_each(|h| println!("{}", hex::encode(h)));
+        }
+        Command::Peers { path } => {
+            let content = fs::read(path).context("Reading torrent file")?;
+            let torrent =
+                serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+
+            let info = serde_bencode::to_bytes(&torrent.info)?;
+            let mut hasher = Sha1::new();
+            hasher.update(&info);
+            let hashed_info = hasher.finalize();
+
+            let tracker_url = reqwest::Url::parse(&format!(
+                "{}?info_hash={}",
+                torrent.announce,
+                hash_encode(hashed_info[..].try_into()?)
+            ))?;
+
+            let client = Client::new().get(tracker_url).query(&TrackerRequest {
+                //info_hash: hashed_info[..].try_into()?,
+                peer_id: "00112233445566778899".to_owned(),
+                port: 6881,
+                uploaded: 0,
+                downloaded: 0,
+                left: torrent.info.length,
+                compact: 1,
+            });
+
+            //eprintln!("{:?}", client);
+
+            let response = client.send().await.context("Tracker request builder")?;
+
+            //eprintln!("{}", response.status());
+            //println!("{}", response.text().await?);
+
+            let response = serde_bencode::from_bytes::<TrackerResponse>(&response.bytes().await?)
+                .context("Decoding response")?;
+
+            //eprintln!("{response:?}");
+
+            let peers: Vec<_> = response
+                .peers
+                .chunks_exact(6)
+                .map(|c| {
+                    SocketAddrV4::new(
+                        Ipv4Addr::new(c[0], c[1], c[2], c[3]),
+                        u16::from_be_bytes([c[4], c[5]]),
+                    )
+                })
+                .collect();
+
+            peers.iter().for_each(|p| println!("{p:?}"));
         }
     }
 
