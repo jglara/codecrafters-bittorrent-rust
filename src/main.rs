@@ -93,10 +93,12 @@ struct TorrentInfo {
 impl TorrentInfo {
     fn piece_hashes(&self) -> anyhow::Result<Vec<&[u8; 20]>> {
         if self.pieces.len() % 20 == 0 {
-            Ok(self.pieces
+            self.pieces
                 .chunks_exact(20)
-                .filter_map(|c| <&[u8; 20]>::try_from(c).ok())
-                .collect())
+                .map(|c| <&[u8; 20]>::try_from(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!(e))
+                .context("Extracting hashes")
         } else {
             Err(anyhow!("Invalid hashes length {}", self.pieces.len()))
         }
