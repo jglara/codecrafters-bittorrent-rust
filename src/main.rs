@@ -1,14 +1,14 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use sha1::{Sha1, Digest};
+use sha1::{Digest, Sha1};
 
-use std::fs;
-use std::path::PathBuf;
 use clap;
 use serde_bencode;
+use std::fs;
+use std::path::PathBuf;
 
 fn parse_bencoded_string(input: &str) -> Option<(serde_json::Value, &str)> {
     input
@@ -38,19 +38,17 @@ fn parse_bencoded_value(input: &str) -> Option<(serde_json::Value, &str)> {
                 input = rem;
             }
             Some((vec.into(), &input[1..]))
-        },
+        }
         Some('d') => {
             let mut input = &input[1..];
             let mut d = serde_json::Map::new();
             while input.chars().next()? != 'e' {
-                
-                let (key,rest) = parse_bencoded_string(input)?;
-                let (val,rest) = parse_bencoded_value(rest)?;
+                let (key, rest) = parse_bencoded_string(input)?;
+                let (val, rest) = parse_bencoded_value(rest)?;
                 if let serde_json::Value::String(key) = key {
-                    d.insert(key,val);
+                    d.insert(key, val);
                 }
                 input = rest;
-                
             }
             Some((d.into(), &input[1..]))
         }
@@ -59,7 +57,7 @@ fn parse_bencoded_value(input: &str) -> Option<(serde_json::Value, &str)> {
 }
 
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    if let Some((v,_)) = parse_bencoded_value(encoded_value) {
+    if let Some((v, _)) = parse_bencoded_value(encoded_value) {
         v
     } else {
         panic!("Unhandled encoded value: {}", encoded_value)
@@ -75,12 +73,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    Decode {
-        value: String
-    },
-    Info {
-        path: PathBuf
-    }
+    Decode { value: String },
+    Info { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,41 +87,58 @@ struct TorrentInfo {
     #[serde(with = "serde_bytes")]
     pieces: Vec<u8>,
 
-    length: usize
-
+    length: usize,
 }
+
+impl TorrentInfo {
+    fn piece_hashes(&self) -> anyhow::Result<Vec<&[u8; 20]>> {
+        if self.pieces.len() % 20 == 0 {
+            Ok(self.pieces
+                .chunks_exact(20)
+                .filter_map(|c| <&[u8; 20]>::try_from(c).ok())
+                .collect())
+        } else {
+            Err(anyhow!("Invalid hashes length {}", self.pieces.len()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TorrentFile {
     announce: String,
     info: TorrentInfo,
 }
 
-
 fn main() -> anyhow::Result<()> {
-
     let args = Args::parse();
 
     match args.command {
-        Command::Decode{value} => {
+        Command::Decode { value } => {
             let decoded_value = decode_bencoded_value(&value);
             println!("{decoded_value}");
         }
-        Command::Info{path} => {
+        Command::Info { path } => {
             let content = fs::read(path).context("Reading torrent file")?;
-            let torrent = serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+            let torrent =
+                serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
 
             let info = serde_bencode::to_bytes(&torrent.info)?;
             let mut hasher = Sha1::new();
             hasher.update(&info);
             let hashed_info = hasher.finalize();
-            
+
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
             println!("Info Hash: {}", hex::encode(hashed_info));
+            println!("Piece Length: {}", torrent.info.piece_length);
+            println!("Piece Hashes:");
+            torrent
+                .info
+                .piece_hashes()?
+                .iter()
+                .for_each(|h| println!("{}", hex::encode(h)));
         }
     }
 
-
     Ok(())
 }
-
