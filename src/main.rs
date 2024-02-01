@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use bittorrent_starter_rust::parser::decode_bencoded_value;
 use bittorrent_starter_rust::peer::Peer;
 use bittorrent_starter_rust::torrent::TorrentFile;
@@ -22,10 +22,26 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    Decode { value: String },
-    Info { path: PathBuf },
-    Peers { path: PathBuf },
-    Handshake { path: PathBuf, peer: SocketAddr },
+    Decode {
+        value: String,
+    },
+    Info {
+        path: PathBuf,
+    },
+    Peers {
+        path: PathBuf,
+    },
+    Handshake {
+        path: PathBuf,
+        peer: SocketAddr,
+    },
+    #[command(rename_all="snake_case")]
+    DownloadPiece {
+        #[arg(short)]
+        output: PathBuf,
+        path: PathBuf,
+        piece_id: usize,
+    },
 }
 
 #[tokio::main]
@@ -73,6 +89,25 @@ async fn main() -> anyhow::Result<()> {
             let peer = Peer::connect(peer, &torrent).await?;
 
             println!("Peer ID: {}", hex::encode(peer.remote_id));
+        }
+        Command::DownloadPiece {
+            output,
+            path,
+            piece_id,
+        } => {
+            let content = fs::read(path).context("Reading torrent file")?;
+            let torrent =
+                serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+
+            let tracker = Tracker::new();
+            let peers: Vec<_> = tracker.req_peers(&torrent).await?;
+
+            let mut peer =
+                Peer::connect(*peers.first().ok_or_else(|| anyhow!("No peers"))?, &torrent).await?;
+
+            let bytes = peer.download_piece(piece_id).await?;
+
+            fs::write(output, bytes)?;
         }
     }
 

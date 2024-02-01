@@ -1,6 +1,7 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use std::io::Read;
 use std::net::SocketAddr;
 
 use tokio::io::AsyncReadExt;
@@ -28,7 +29,7 @@ impl Handshake {
     }
 
     fn to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + 19 + 8 + 20 + 20);
+        let mut buf = BytesMut::with_capacity(HANDSHAKE_LEN);
 
         buf.put_u8(BITTORRENT.len() as u8);
         buf.put_slice(BITTORRENT);
@@ -46,6 +47,141 @@ impl Handshake {
         Ok(Handshake {
             info_hash: buf[..20].try_into()?,
             peer_id: buf[20..].try_into()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Message<'a> {
+    length: usize,
+    kind: MessageType,
+    payload: MessagePayload<'a>,
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+enum MessageType {
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have,
+    Bitfield,
+    Request,
+    Piece,
+    Cancel,
+}
+
+#[derive(Debug)]
+enum MessagePayload<'a> {
+    None,
+    Have(u32),
+    Bitfield(&'a [u8]),
+    PieceInfo {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        piece: &'a [u8],
+    },
+}
+
+impl<'a> Message<'a> {
+    fn status(kind: MessageType) -> Self {
+        Message {
+            length: 1,
+            kind: kind,
+            payload: MessagePayload::None,
+        }
+    }
+
+    fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(self.length);
+        buf.put_u32(self.length as u32);
+        buf.put_u8(self.kind as u8);
+        match &self.payload {
+            MessagePayload::None => {}
+            MessagePayload::Bitfield(bf) => buf.put_slice(bf),
+            MessagePayload::Have(index) => buf.put_u32(*index),
+            MessagePayload::PieceInfo {
+                index,
+                begin,
+                length,
+            } => {
+                buf.put_u32(*index);
+                buf.put_u32(*begin);
+                buf.put_u32(*length);
+            }
+            MessagePayload::Piece {
+                index,
+                begin,
+                piece,
+            } => {
+                buf.put_u32(*index);
+                buf.put_u32(*begin);
+                buf.put_slice(piece)
+            }
+        }
+
+        buf.freeze()
+    }
+
+    fn from_bytes(mut buf: &'a [u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(buf.len() >= 5);
+
+        let len = buf.get_u32() as usize;
+        let kind = buf.get_u8();
+
+        let (kind, payload) = match kind {
+            0 => (MessageType::Choke, MessagePayload::None),
+            1 => (MessageType::Unchoke, MessagePayload::None),
+            2 => (MessageType::Interested, MessagePayload::None),
+            3 => (MessageType::NotInterested, MessagePayload::None),
+            4 => (MessageType::Have, MessagePayload::Have(buf.get_u32())),
+            5 => (MessageType::Bitfield, MessagePayload::Bitfield(&buf[..])),
+            6 => {
+                anyhow::ensure!(buf.len() == 4 * 3);
+                (
+                    MessageType::Request,
+                    MessagePayload::PieceInfo {
+                        index: buf.get_u32(),
+                        begin: buf.get_u32(),
+                        length: buf.get_u32(),
+                    },
+                )
+            }
+            7 => {
+                anyhow::ensure!(buf.len() > 4 * 2);
+                (
+                    MessageType::Piece,
+                    MessagePayload::Piece {
+                        index: buf.get_u32(),
+                        begin: buf.get_u32(),
+                        piece: &buf[..],
+                    },
+                )
+            }
+            8 => {
+                anyhow::ensure!(buf.len() == 4 * 3);
+                (
+                    MessageType::Cancel,
+                    MessagePayload::PieceInfo {
+                        index: buf.get_u32(),
+                        begin: buf.get_u32(),
+                        length: buf.get_u32(),
+                    },
+                )
+            }
+            _ => anyhow::bail!("Invalid message type"),
+        };
+
+        Ok(Message {
+            length: len,
+            kind: kind,
+            payload: payload,
         })
     }
 }
@@ -81,5 +217,44 @@ impl Peer {
             local_id: local_id.to_owned(),
             remote_id: hs_resp.peer_id,
         })
+    }
+
+    pub async fn download_piece(&mut self, piece_index: usize) -> anyhow::Result<Bytes> {
+        let mut buf = [0; 5 + 16 * 1024];
+
+        // wait for a bitfield message
+        loop {
+            self.stream.read_exact(&mut buf[..5]).await?; // length + type
+            //eprintln!("Read {:?}", &buf[..5]);
+            let len = u32::from_be_bytes(buf[..4].try_into()?);
+            self.stream.read_exact(&mut buf[5..5+len as usize-1]).await?; // payload
+            let msg = Message::from_bytes(&buf[..4+len as usize])?;
+
+            eprintln!("Received: {msg:?}");
+
+            if let MessageType::Bitfield = msg.kind {break};
+        }
+
+        
+        // Send interested message
+        let msg = Message::status(MessageType::Interested);
+        eprintln!("Sending {msg:?}");
+        self.stream.write_all(&msg.to_bytes()).await?;
+
+        // wait unchoke
+        loop {
+            self.stream.read_exact(&mut buf[..5]).await?; // length + type
+            //eprintln!("Read {:?}", &buf[..5]);
+            let len = u32::from_be_bytes(buf[..4].try_into()?);
+            self.stream.read_exact(&mut buf[5..5+len as usize-1]).await?; // payload
+            let msg = Message::from_bytes(&buf[..4+len as usize])?;
+
+            eprintln!("Received: {msg:?}");
+
+            if let MessageType::Unchoke = msg.kind {break};
+        }
+
+
+        Err(anyhow!(""))
     }
 }
