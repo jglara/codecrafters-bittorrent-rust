@@ -3,6 +3,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 use tokio::io::AsyncReadExt;
@@ -275,6 +276,23 @@ impl Peer {
         }
     }
 
+    fn requests(piece_id: usize, block_size: usize, total_len: usize) -> VecDeque<Message<'static>>
+    {
+        (0..(total_len / block_size)+1).scan(0, |cur_offset, _| {
+            if *cur_offset < total_len {
+            let (block_begin, block_length) = (
+                *cur_offset,
+                std::cmp::min(block_size, total_len - *cur_offset),
+            );
+            let msg = Message::request(piece_id, block_begin, block_length);
+            *cur_offset += block_length;
+            Some(msg)
+        } else {
+            None
+        }
+        }).collect()
+    }
+
     pub async fn download_piece(
         &mut self,
         piece_index: usize,
@@ -285,6 +303,8 @@ impl Peer {
         let mut buf = [0; 1024 + BLOCK_SIZE];
         let mut piece_buf: BytesMut = BytesMut::with_capacity(piece_length);
         let mut pending_piece_offset = 0;
+        let mut pending_requests = Peer::requests(piece_index, BLOCK_SIZE, piece_length);
+        const PIPELINED_REQUESTS: u32 = 5;
 
         eprintln!("Downloading piece {piece_index} len {piece_length}");
 
@@ -307,15 +327,16 @@ impl Peer {
                     state = PeerState::Choked;
                 },
                 (PeerState::Choked, MessageType::Unchoke, _) => {
-                    // Send request
-                    let (block_begin, block_length) = (
-                        pending_piece_offset,
-                        std::cmp::min(BLOCK_SIZE, piece_length - pending_piece_offset),
-                    );
-                    let msg = Message::request(piece_index, block_begin, block_length);
-                    eprintln!("Sending {msg:?}");
-                    self.stream.write_all(&msg.to_bytes()).await?;
-
+                    // Send requests
+                    for _ in 0..PIPELINED_REQUESTS {
+                        if let Some(msg) = pending_requests.pop_front() {
+                            eprintln!("Sending {msg:?}");
+                            self.stream.write_all(&msg.to_bytes()).await?;
+                        } else {
+                            break;
+                        }
+                    }
+                    
                     // change state to unchoked
                     state = PeerState::Unchoked;
                 }
@@ -339,16 +360,12 @@ impl Peer {
 
                     pending_piece_offset += piece.len();
 
-                    // send next request (if needed)
-                    if pending_piece_offset < piece_length {
-                        let (block_begin, block_length) = (
-                            pending_piece_offset,
-                            std::cmp::min(BLOCK_SIZE, piece_length - pending_piece_offset),
-                        );
-                        let msg = Message::request(piece_index, block_begin, block_length);
+                    // Send next request
+                    if let Some(msg) = pending_requests.pop_front() {
                         eprintln!("Sending {msg:?}");
                         self.stream.write_all(&msg.to_bytes()).await?;
                     }
+                    
                 }
                 (_, k, _) => anyhow::bail!("unexpected msg {:?} state {state:?}", k),
             }
