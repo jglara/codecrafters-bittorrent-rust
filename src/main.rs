@@ -10,6 +10,7 @@ use clap;
 use serde_bencode;
 use std::fs;
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -141,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
 
             peer.recv_bitfield().await?;
 
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&output)?;
+
             for (piece_id, piece_length, piece_hash) in torrent
                 .info
                 .piece_hashes()?
@@ -162,9 +168,12 @@ async fn main() -> anyhow::Result<()> {
                     .download_piece(piece_id, piece_length, piece_hash)
                     .await?;
 
-                fs::write(&output, bytes)?;
+                file.write(&bytes[..])?;
+
                 eprintln!("Piece {piece_id} downloaded to {}", output.display());
             }
+
+            file.flush()?;
 
             println!("Downloaded {} to {}.", path.display(), output.display());
         }

@@ -325,6 +325,8 @@ impl Peer {
             let msg = Message::status(MessageType::Interested);
             eprintln!("Sending {msg:?}");
             self.stream.write_all(&msg.to_bytes()).await?;
+
+            self.local_state = LocalState::Interested;
         }
 
         if let PeerState::Unchoked = self.remote_state {
