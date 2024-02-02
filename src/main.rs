@@ -106,7 +106,13 @@ async fn main() -> anyhow::Result<()> {
                 Peer::connect(*peers.first().ok_or_else(|| anyhow!("No peers"))?, &torrent).await?;
 
             peer.recv_bitfield().await?;
-            let bytes = peer.download_piece(piece_id, torrent.info.piece_length, torrent.info.piece_hashes()?[piece_id]).await?;
+            let piece_length = if piece_id == torrent.info.piece_hashes()?.len()-1 {
+                torrent.info.length % torrent.info.piece_length
+            } else {
+                torrent.info.piece_length
+            };
+
+            let bytes = peer.download_piece(piece_id, piece_length, torrent.info.piece_hashes()?[piece_id]).await?;
 
             fs::write(&output, bytes)?;
             println!("Piece {piece_id} downloaded to {}", output.display());
