@@ -332,6 +332,7 @@ impl Peer {
                         piece,
                     },
                 ) => {
+                    eprintln!("Piece {index} offset={begin} len={}", piece.len());
                     anyhow::ensure!(index as usize == piece_index);
                     anyhow::ensure!(begin as usize == pending_piece_offset);
                     piece_buf.put(piece);
