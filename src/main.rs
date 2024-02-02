@@ -35,12 +35,17 @@ enum Command {
         path: PathBuf,
         peer: SocketAddr,
     },
-    #[command(rename_all="snake_case")]
+    #[command(rename_all = "snake_case")]
     DownloadPiece {
         #[arg(short)]
         output: PathBuf,
         path: PathBuf,
         piece_id: usize,
+    },
+    Download {
+        #[arg(short)]
+        output: PathBuf,
+        path: PathBuf,
     },
 }
 
@@ -106,16 +111,62 @@ async fn main() -> anyhow::Result<()> {
                 Peer::connect(*peers.first().ok_or_else(|| anyhow!("No peers"))?, &torrent).await?;
 
             peer.recv_bitfield().await?;
-            let piece_length = if piece_id == torrent.info.piece_hashes()?.len()-1 {
+            let piece_length = if piece_id == torrent.info.piece_hashes()?.len() - 1 {
                 torrent.info.length % torrent.info.piece_length
             } else {
                 torrent.info.piece_length
             };
 
-            let bytes = peer.download_piece(piece_id, piece_length, torrent.info.piece_hashes()?[piece_id]).await?;
+            let bytes = peer
+                .download_piece(
+                    piece_id,
+                    piece_length,
+                    torrent.info.piece_hashes()?[piece_id],
+                )
+                .await?;
 
             fs::write(&output, bytes)?;
             println!("Piece {piece_id} downloaded to {}", output.display());
+        }
+        Command::Download { output, path } => {
+            let content = fs::read(&path).context("Reading torrent file")?;
+            let torrent =
+                serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
+
+            let tracker = Tracker::new();
+            let peers: Vec<_> = tracker.req_peers(&torrent).await?;
+
+            let mut peer =
+                Peer::connect(*peers.first().ok_or_else(|| anyhow!("No peers"))?, &torrent).await?;
+
+            peer.recv_bitfield().await?;
+
+            for (piece_id, piece_length, piece_hash) in torrent
+                .info
+                .piece_hashes()?
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    (
+                        i,
+                        if i == torrent.info.piece_hashes().unwrap().len() - 1 {
+                            torrent.info.length % torrent.info.piece_length
+                        } else {
+                            torrent.info.piece_length
+                        },
+                        h,
+                    )
+                })
+            {
+                let bytes = peer
+                    .download_piece(piece_id, piece_length, piece_hash)
+                    .await?;
+
+                fs::write(&output, bytes)?;
+                eprintln!("Piece {piece_id} downloaded to {}", output.display());
+            }
+
+            println!("Downloaded {} to {}.", path.display(), output.display());
         }
     }
 

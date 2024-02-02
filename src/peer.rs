@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 
-
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -96,6 +95,11 @@ enum MessagePayload<'a> {
 enum PeerState {
     Choked,
     Unchoked,
+}
+
+enum LocalState {
+    Interested,
+    Uninterested,
 }
 
 impl<'a> Message<'a> {
@@ -213,6 +217,8 @@ pub struct Peer {
     pub remote_id: [u8; 20],
     pub pieces_bitfield: Vec<u8>,
     stream: TcpStream,
+    local_state: LocalState,
+    remote_state: PeerState,
 }
 
 impl Peer {
@@ -239,6 +245,8 @@ impl Peer {
             local_id: local_id.to_owned(),
             remote_id: hs_resp.peer_id,
             pieces_bitfield: vec![],
+            local_state: LocalState::Uninterested,
+            remote_state: PeerState::Choked,
         })
     }
 
@@ -253,7 +261,6 @@ impl Peer {
                 payload: MessagePayload::None,
             });
         }
-
 
         self.stream
             .read_exact(&mut buf[4..4 + len as usize])
@@ -276,21 +283,26 @@ impl Peer {
         }
     }
 
-    fn requests(piece_id: usize, block_size: usize, total_len: usize) -> VecDeque<Message<'static>>
-    {
-        (0..(total_len / block_size)+1).scan(0, |cur_offset, _| {
-            if *cur_offset < total_len {
-            let (block_begin, block_length) = (
-                *cur_offset,
-                std::cmp::min(block_size, total_len - *cur_offset),
-            );
-            let msg = Message::request(piece_id, block_begin, block_length);
-            *cur_offset += block_length;
-            Some(msg)
-        } else {
-            None
-        }
-        }).collect()
+    fn requests(
+        piece_id: usize,
+        block_size: usize,
+        total_len: usize,
+    ) -> VecDeque<Message<'static>> {
+        (0..(total_len / block_size) + 1)
+            .scan(0, |cur_offset, _| {
+                if *cur_offset < total_len {
+                    let (block_begin, block_length) = (
+                        *cur_offset,
+                        std::cmp::min(block_size, total_len - *cur_offset),
+                    );
+                    let msg = Message::request(piece_id, block_begin, block_length);
+                    *cur_offset += block_length;
+                    Some(msg)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub async fn download_piece(
@@ -309,11 +321,24 @@ impl Peer {
         eprintln!("Downloading piece {piece_index} len {piece_length}");
 
         // Send interested message
-        let msg = Message::status(MessageType::Interested);
-        eprintln!("Sending {msg:?}");
-        self.stream.write_all(&msg.to_bytes()).await?;
+        if let LocalState::Uninterested = self.local_state {
+            let msg = Message::status(MessageType::Interested);
+            eprintln!("Sending {msg:?}");
+            self.stream.write_all(&msg.to_bytes()).await?;
+        }
 
-        let mut state = PeerState::Choked;
+        if let PeerState::Unchoked = self.remote_state {
+            // Send requests
+            for _ in 0..PIPELINED_REQUESTS {
+                if let Some(msg) = pending_requests.pop_front() {
+                    eprintln!("Sending {msg:?}");
+                    self.stream.write_all(&msg.to_bytes()).await?;
+                } else {
+                    break;
+                }
+            }
+        }
+
         while pending_piece_offset < piece_length {
             let msg = self.recv_message(&mut buf).await?;
 
@@ -321,11 +346,11 @@ impl Peer {
                 continue;
             };
 
-            match (state, msg.kind, msg.payload) {
+            match (self.remote_state, msg.kind, msg.payload) {
                 (PeerState::Choked, MessageType::Choke, _) => {
                     // change state to choked
-                    state = PeerState::Choked;
-                },
+                    self.remote_state = PeerState::Choked;
+                }
                 (PeerState::Choked, MessageType::Unchoke, _) => {
                     // Send requests
                     for _ in 0..PIPELINED_REQUESTS {
@@ -336,13 +361,13 @@ impl Peer {
                             break;
                         }
                     }
-                    
+
                     // change state to unchoked
-                    state = PeerState::Unchoked;
+                    self.remote_state = PeerState::Unchoked;
                 }
                 (PeerState::Unchoked, MessageType::Choke, _) => {
                     // change state to choked
-                    state = PeerState::Choked;
+                    self.remote_state = PeerState::Choked;
                 }
                 (
                     PeerState::Unchoked,
@@ -365,9 +390,8 @@ impl Peer {
                         eprintln!("Sending {msg:?}");
                         self.stream.write_all(&msg.to_bytes()).await?;
                     }
-                    
                 }
-                (_, k, _) => anyhow::bail!("unexpected msg {:?} state {state:?}", k),
+                (_, k, _) => anyhow::bail!("unexpected msg {:?} state {:?}", k, self.remote_state),
             }
         }
 
@@ -377,7 +401,11 @@ impl Peer {
         let hashed_info = hasher.finalize();
 
         if &hashed_info[..] != piece_hash {
-            Err(anyhow!("Invalid hash of received piece {:?} {:?}", hashed_info, piece_hash))
+            Err(anyhow!(
+                "Invalid hash of received piece {:?} {:?}",
+                hashed_info,
+                piece_hash
+            ))
         } else {
             Ok(piece_buf.freeze())
         }
