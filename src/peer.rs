@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use sha1::{Digest, Sha1};
 
-use std::io::Read;
+
 use std::net::SocketAddr;
 
 use tokio::io::AsyncReadExt;
@@ -70,6 +71,7 @@ enum MessageType {
     Request,
     Piece,
     Cancel,
+    Ping = 255,
 }
 
 #[derive(Debug)]
@@ -89,12 +91,30 @@ enum MessagePayload<'a> {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PeerState {
+    Choked,
+    Unchoked,
+}
+
 impl<'a> Message<'a> {
     fn status(kind: MessageType) -> Self {
         Message {
             length: 1,
             kind: kind,
             payload: MessagePayload::None,
+        }
+    }
+
+    fn request(piece_id: usize, block_begin: usize, block_length: usize) -> Self {
+        Message {
+            length: 1 + 4 * 3,
+            kind: MessageType::Request,
+            payload: MessagePayload::PieceInfo {
+                index: piece_id as u32,
+                begin: block_begin as u32,
+                length: block_length as u32,
+            },
         }
     }
 
@@ -190,6 +210,7 @@ pub struct Peer {
     pub remote_addr: SocketAddr,
     pub local_id: [u8; 20],
     pub remote_id: [u8; 20],
+    pub pieces_bitfield: Vec<u8>,
     stream: TcpStream,
 }
 
@@ -216,45 +237,131 @@ impl Peer {
             stream: tcp_peer,
             local_id: local_id.to_owned(),
             remote_id: hs_resp.peer_id,
+            pieces_bitfield: vec![],
         })
     }
 
-    pub async fn download_piece(&mut self, piece_index: usize) -> anyhow::Result<Bytes> {
-        let mut buf = [0; 5 + 16 * 1024];
-
-        // wait for a bitfield message
-        loop {
-            self.stream.read_exact(&mut buf[..5]).await?; // length + type
-            //eprintln!("Read {:?}", &buf[..5]);
-            let len = u32::from_be_bytes(buf[..4].try_into()?);
-            self.stream.read_exact(&mut buf[5..5+len as usize-1]).await?; // payload
-            let msg = Message::from_bytes(&buf[..4+len as usize])?;
-
-            eprintln!("Received: {msg:?}");
-
-            if let MessageType::Bitfield = msg.kind {break};
+    async fn recv_message<'a>(&mut self, buf: &'a mut [u8]) -> anyhow::Result<Message<'a>> {
+        self.stream.read_exact(&mut buf[..4]).await?; // length
+                                                      //eprintln!("Read {:?}", &buf[..5]);
+        let len = u32::from_be_bytes(buf[..4].try_into()?);
+        if len == 0 {
+            return Ok(Message {
+                length: 0,
+                kind: MessageType::Ping,
+                payload: MessagePayload::None,
+            });
         }
 
-        
+
+        self.stream
+            .read_exact(&mut buf[4..4 + len as usize])
+            .await?; // type + payload
+        let msg = Message::from_bytes(&buf[..4 + len as usize])?;
+
+        eprintln!("Received: {:?}", msg.kind);
+
+        Ok(msg)
+    }
+
+    pub async fn recv_bitfield(&mut self) -> anyhow::Result<()> {
+        let mut buf = [0; 1028];
+        let msg = self.recv_message(&mut buf).await?;
+        if let MessagePayload::Bitfield(bf) = msg.payload {
+            self.pieces_bitfield.extend_from_slice(bf);
+            Ok(())
+        } else {
+            Err(anyhow!("Invalid msg {:?}", msg))
+        }
+    }
+
+    pub async fn download_piece(
+        &mut self,
+        piece_index: usize,
+        piece_length: usize,
+        piece_hash: &[u8; 20],
+    ) -> anyhow::Result<Bytes> {
+        const BLOCK_SIZE: usize = 16 * 1024; // 16 Kb
+        let mut buf = [0; 1024 + BLOCK_SIZE];
+        let mut piece_buf: BytesMut = BytesMut::with_capacity(piece_length);
+        let mut pending_piece_offset = 0;
+
+        eprintln!("Downloading piece {piece_index} len {piece_length}");
+
         // Send interested message
         let msg = Message::status(MessageType::Interested);
         eprintln!("Sending {msg:?}");
         self.stream.write_all(&msg.to_bytes()).await?;
 
-        // wait unchoke
-        loop {
-            self.stream.read_exact(&mut buf[..5]).await?; // length + type
-            //eprintln!("Read {:?}", &buf[..5]);
-            let len = u32::from_be_bytes(buf[..4].try_into()?);
-            self.stream.read_exact(&mut buf[5..5+len as usize-1]).await?; // payload
-            let msg = Message::from_bytes(&buf[..4+len as usize])?;
+        let mut state = PeerState::Choked;
+        while pending_piece_offset < piece_length {
+            let msg = self.recv_message(&mut buf).await?;
 
-            eprintln!("Received: {msg:?}");
+            if msg.length == 0 {
+                continue;
+            };
 
-            if let MessageType::Unchoke = msg.kind {break};
+            match (state, msg.kind, msg.payload) {
+                (PeerState::Choked, MessageType::Choke, _) => {
+                    // change state to choked
+                    state = PeerState::Choked;
+                },
+                (PeerState::Choked, MessageType::Unchoke, _) => {
+                    // Send request
+                    let (block_begin, block_length) = (
+                        pending_piece_offset,
+                        std::cmp::min(BLOCK_SIZE, piece_length - pending_piece_offset),
+                    );
+                    let msg = Message::request(piece_index, block_begin, block_length);
+                    eprintln!("Sending {msg:?}");
+                    self.stream.write_all(&msg.to_bytes()).await?;
+
+                    // change state to unchoked
+                    state = PeerState::Unchoked;
+                }
+                (PeerState::Unchoked, MessageType::Choke, _) => {
+                    // change state to choked
+                    state = PeerState::Choked;
+                }
+                (
+                    PeerState::Unchoked,
+                    MessageType::Piece,
+                    MessagePayload::Piece {
+                        index,
+                        begin,
+                        piece,
+                    },
+                ) => {
+                    anyhow::ensure!(index as usize == piece_index);
+                    anyhow::ensure!(begin as usize == pending_piece_offset);
+                    piece_buf.put(piece);
+
+                    pending_piece_offset += piece.len();
+
+                    // send next request (if needed)
+                    if pending_piece_offset < piece_length {
+                        let (block_begin, block_length) = (
+                            pending_piece_offset,
+                            std::cmp::min(BLOCK_SIZE, piece_length - pending_piece_offset),
+                        );
+                        let msg = Message::request(piece_index, block_begin, block_length);
+                        eprintln!("Sending {msg:?}");
+                        self.stream.write_all(&msg.to_bytes()).await?;
+                    }
+                }
+                (_, k, _) => anyhow::bail!("unexpected msg {:?} state {state:?}", k),
+            }
         }
 
+        // check hash
+        let mut hasher = Sha1::new();
+        hasher.update(&piece_buf[..]);
+        let hashed_info = hasher.finalize();
 
-        Err(anyhow!(""))
+        if &hashed_info[..] != piece_hash {
+            Err(anyhow!("Invalid hash of received piece {:?} {:?}", hashed_info, piece_hash))
+        } else {
+            Ok(piece_buf.freeze())
+        }
     }
 }
