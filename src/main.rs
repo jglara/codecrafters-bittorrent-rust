@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
                                     peer_tx.send((piece_id, bytes)).await?;
                                 }
                             }
+                            #[allow(unreachable_code)]
                             Ok::<(), anyhow::Error>(())
                         });
 
