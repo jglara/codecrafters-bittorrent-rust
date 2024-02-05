@@ -8,8 +8,11 @@ use clap::Subcommand;
 
 use clap;
 use serde_bencode;
+use std::collections::BTreeMap;
 use std::fs;
+use tokio::sync::mpsc;
 
+use bytes::Bytes;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +52,8 @@ enum Command {
         path: PathBuf,
     },
 }
+
+const NUM_CONCURRENT_PEERS: usize = 5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -122,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 .download_piece(
                     piece_id,
                     piece_length,
-                    torrent.info.piece_hashes()?[piece_id],
+                    *torrent.info.piece_hashes()?[piece_id],
                 )
                 .await?;
 
@@ -135,19 +140,44 @@ async fn main() -> anyhow::Result<()> {
                 serde_bencode::from_bytes::<TorrentFile>(&content).context("parse torrent file")?;
 
             let tracker = Tracker::new();
-            let peers: Vec<_> = tracker.req_peers(&torrent).await?;
+            let peer_addrs: Vec<_> = tracker.req_peers(&torrent).await?;
 
-            let mut peer =
-                Peer::connect(*peers.first().ok_or_else(|| anyhow!("No peers"))?, &torrent).await?;
+            let mut peers: Vec<_> = Vec::new();
 
-            peer.recv_bitfield().await?;
+            let (peer_tx, mut dl_rx) = mpsc::channel(32);
+            for peer_addr in peer_addrs {
+                match Peer::connect(peer_addr, &torrent).await {
+                    Ok(mut peer) => {
+                        let (dl_tx, mut peer_rx) = mpsc::channel(32);
+                        let peer_tx = peer_tx.clone();
+                        tokio::spawn(async move {
+                            peer.recv_bitfield().await?;
+                            loop {
+                                if let Some((piece_id, piece_length, piece_hash)) =
+                                    peer_rx.recv().await
+                                {
+                                    let bytes = peer
+                                        .download_piece(piece_id, piece_length, piece_hash)
+                                        .await?;
+                                    peer_tx.send((piece_id, bytes)).await?;
+                                }
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        });
 
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&output)?;
+                        peers.push(dl_tx);
+                    }
+                    Err(e) => eprintln!("Error {e:?}"),
+                }
 
-            for (piece_id, piece_length, piece_hash) in torrent
+                if peers.len() >= NUM_CONCURRENT_PEERS {
+                    break;
+                };
+            }
+
+            //let pieces_info = torrent.info.piece_hashes()?.iter().map(|i| )
+
+            for ((piece_id, piece_length, &piece_hash), peer_tx) in torrent
                 .info
                 .piece_hashes()?
                 .iter()
@@ -163,14 +193,28 @@ async fn main() -> anyhow::Result<()> {
                         h,
                     )
                 })
+                .zip(peers.iter().cycle())
             {
-                let bytes = peer
-                    .download_piece(piece_id, piece_length, piece_hash)
-                    .await?;
+                peer_tx.send((piece_id, piece_length, piece_hash.clone())).await?;
+            }
 
+            let mut downloaded_pieces: BTreeMap<usize, Bytes> = BTreeMap::new();
+
+            while downloaded_pieces.len() < torrent.info.piece_hashes()?.len() {
+                if let Some((piece_id, piece)) = dl_rx.recv().await {
+                    eprintln!("Piece {piece_id} downloaded");
+                    downloaded_pieces.insert(piece_id, piece);
+                }
+            }
+
+            // write pieces into a file in order
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&output)?;
+
+            for (_, bytes) in downloaded_pieces.iter() {
                 file.write(&bytes[..])?;
-
-                eprintln!("Piece {piece_id} downloaded to {}", output.display());
             }
 
             file.flush()?;

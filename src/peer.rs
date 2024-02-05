@@ -309,7 +309,7 @@ impl Peer {
         &mut self,
         piece_index: usize,
         piece_length: usize,
-        piece_hash: &[u8; 20],
+        piece_hash: [u8; 20],
     ) -> anyhow::Result<Bytes> {
         const BLOCK_SIZE: usize = 16 * 1024; // 16 Kb
         let mut buf = [0; 1024 + BLOCK_SIZE];
